@@ -48,9 +48,10 @@ export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 /**
  * Split a MarkdownV2 (or plain) payload so each chunk fits Telegram's size limit.
  *
- * Prefers breaking on newlines. Never ends a chunk on a lone trailing backslash,
- * which would corrupt a MarkdownV2 escape sequence across chunk boundaries.
- * Hard-splits only when a single line exceeds the limit.
+ * Prefers breaking on newlines, omitting the separator newline from the chunks.
+ * Never splits a UTF-16 surrogate pair or ends a chunk on a lone backslash.
+ * Hard-splits only when a single line exceeds the limit. Throws if the limit
+ * cannot fit a complete code point or MarkdownV2 escape.
  */
 export function splitTelegramMessage(
   text: string,
@@ -64,32 +65,26 @@ export function splitTelegramMessage(
   const parts: string[] = [];
   let remaining = text;
 
+  function safeCut(cut: number): number {
+    const before = remaining.charCodeAt(cut - 1);
+    const after = remaining.charCodeAt(cut);
+    if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
+      cut -= 1;
+    }
+    // Retreating before an emoji can expose an escape prefix as well.
+    let start = cut;
+    while (start > 0 && remaining[start - 1] === "\\") start -= 1;
+    return cut - ((cut - start) % 2);
+  }
+
   while (remaining.length > limit) {
     let cut = remaining.lastIndexOf("\n", limit);
-    if (cut <= 0) cut = limit;
-
-    // If the chunk would end on an odd-length trailing backslash run, the next
-    // character belongs to that escape — pull the cut back before the run.
-    while (cut > 0) {
-      let i = cut - 1;
-      let slashes = 0;
-      while (i >= 0 && remaining[i] === "\\") {
-        slashes += 1;
-        i -= 1;
-      }
-      if (slashes % 2 === 1) {
-        cut = cut - 1;
-        continue;
-      }
-      break;
-    }
-
+    if (cut <= 0) cut = Math.floor(limit);
+    cut = safeCut(cut);
+    // An unsafe newline near the start may still allow a safe hard split.
+    if (cut <= 0) cut = safeCut(Math.floor(limit));
     if (cut <= 0) {
-      cut = limit;
-      if (remaining[cut - 1] === "\\" && cut < remaining.length) {
-        cut = limit - 1;
-        if (cut <= 0) cut = limit;
-      }
+      throw new RangeError(`splitTelegramMessage limit ${limit} cannot fit a code point or escape`);
     }
 
     parts.push(remaining.slice(0, cut));
